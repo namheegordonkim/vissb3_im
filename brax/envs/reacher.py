@@ -169,8 +169,8 @@ class Reacher(PipelineEnv):
     def reset(self, rng: jax.Array) -> State:
         rng, rng1, rng2 = jax.random.split(rng, 3)
 
-        q = self.sys.init_q + jax.random.uniform(rng1, (self.sys.q_size(),), minval=-0.1, maxval=0.1)
-        qd = jax.random.uniform(rng2, (self.sys.qd_size(),), minval=-0.005, maxval=0.005)
+        q = self.sys.init_q
+        qd = jp.zeros(self.sys.qd_size())
 
         # set the target q, qd
         _, target = self._random_target(rng)
@@ -191,7 +191,7 @@ class Reacher(PipelineEnv):
         obs = self._get_obs(pipeline_state)
 
         # vector from tip to target is last 3 entries of obs vector
-        reward_dist = jp.exp(-(10**2.2) * math.safe_norm(obs[-3:]))
+        reward_dist = jp.exp(-(10**2.9) * math.safe_norm(obs[-3:]) ** 2)
         reward = reward_dist
 
         state.metrics.update(
