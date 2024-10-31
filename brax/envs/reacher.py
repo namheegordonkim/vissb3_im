@@ -241,7 +241,7 @@ class Reacher(PipelineEnv):
   def _random_target(self, rng: jax.Array) -> Tuple[jax.Array, jax.Array]:
     """Returns a target location in a random circle slightly above xy plane."""
     rng, rng1, rng2 = jax.random.split(rng, 3)
-    dist = 0.2 * jax.random.uniform(rng1)
+    dist = 0.01 * jax.random.uniform(rng1)
     ang = jp.pi * 2.0 * jax.random.uniform(rng2)
     target_x = dist * jp.cos(ang)
     target_y = dist * jp.sin(ang)

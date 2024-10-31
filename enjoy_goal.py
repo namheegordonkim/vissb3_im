@@ -2,13 +2,6 @@ from argparse import ArgumentParser
 from dataclasses import dataclass
 from imgui_bundle import immapp
 from imgui_bundle._imgui_bundle import imgui, hello_imgui
-from imitation.algorithms.adversarial.gail import GAIL
-from imitation.algorithms.bc import BC
-from imitation.data import rollout
-from imitation.data.types import Transitions
-from imitation.rewards.reward_nets import BasicRewardNet
-from imitation.util.networks import RunningNorm
-from mujoco import mjx
 from pyvista_imgui import ImguiPlotter
 from scipy.spatial.transform import Rotation
 from utils.env_containers import EnvContainer
@@ -64,31 +57,24 @@ class AppState:
     def __init__(
         self,
         scene_visuals: VisualArray,
-        ghost_visuals: VisualArray,
         trail_visuals: VisualArray,
+        guide_visuals: VisualArray,
         train_vecenv: MyVecEnv,
         eval_vecenv: MyVecEnv,
         ppo: MyPPO,
-        dataset: dict,
-        bc: BC,
-        gail: GAIL,
     ):
         self.scene_meshes = scene_visuals.meshes
         self.scene_actors = scene_visuals.actors
-        self.ghost_meshes = ghost_visuals.meshes
-        self.ghost_actors = ghost_visuals.actors
         self.trail_meshes = trail_visuals.meshes
         self.trail_actors = trail_visuals.actors
+        self.guide_meshes = guide_visuals.meshes
+        self.guide_actors = guide_visuals.actors
         self.train_vecenv = train_vecenv
         self.eval_vecenv = eval_vecenv
         self.ppo = ppo
         _, self.ppo_callback = self.ppo._setup_learn(int(1e6), None)  # Setup PPO learning callback.
-        self.dataset = dataset
-        self.bc = bc
-        self.gail = gail
 
         # Initialize GUI state parameters
-        self.bc_n_epochs = 1
         self.color_code = 0  # Color coding for different visual elements.
         self.data_playing = False
         self.dataset_frame = 0
@@ -111,7 +97,14 @@ class AppState:
         self.traj_frame = 0
         self.traj_idx = 0
         self.trajectory_t = 0
-        self.trajectory_x = None
+        self.train_trajectory_x = None
+        self.train_trajectory_x = None
+        self.eval_trajectory_x = None
+        self.trail_source = 0
+        self.curriculum_stage = 10
+
+        self.old_q = self.train_vecenv.state.info["first_pipeline_state"].q
+        self.old_qd = self.train_vecenv.state.info["first_pipeline_state"].qd
 
 
 def setup_and_run_gui(pl: ImguiPlotter, app_state: AppState):
@@ -180,7 +173,18 @@ def setup_and_run_gui(pl: ImguiPlotter, app_state: AppState):
 
         # If this is the first time loading or the reset button is clicked, reset evaluation environment
         if app_state.first_time or reset_clicked:
-            app_state.eval_obs = app_state.eval_vecenv.reset()
+            app_state.eval_vecenv.reset()
+            old_radius = 0.01
+            new_radius = 0.01 + app_state.curriculum_stage * 0.02
+            radius_scale = new_radius / old_radius
+            q = app_state.eval_vecenv.state.pipeline_state.q
+            qd = app_state.eval_vecenv.state.pipeline_state.qd
+            q = q.at[..., 2:].set(q[..., 2:] * radius_scale)
+            new_first_pipeline_state = app_state.eval_vecenv.env_container.jit_env_pipeline_init(q, qd)
+            new_first_obs = app_state.eval_vecenv.env_container.jit_env_get_obs(new_first_pipeline_state)
+            app_state.eval_obs = new_first_obs
+            app_state.eval_vecenv.state = app_state.eval_vecenv.state.replace(pipeline_state=new_first_pipeline_state, obs=new_first_obs)
+            app_state.eval_vecenv.trajectory = [app_state.eval_vecenv.state.pipeline_state.x]
 
         # Checkbox for Play Mode and Deterministic settings
         imgui.same_line()
@@ -197,7 +201,7 @@ def setup_and_run_gui(pl: ImguiPlotter, app_state: AppState):
         imgui.text(f"Eval Reward Stat: {app_state.eval_rewards.sum(-1).mean():.2f} +/- {app_state.eval_rewards.sum(-1).std():.2f}")  # Display reward stats
 
         # Slider for adjusting the ratio between GAIL reward and task reward
-        changed, app_state.reward_ratio = imgui.slider_float("GAIL / Task Reward Ratio", app_state.reward_ratio, 0, 1)
+        # changed, app_state.reward_ratio = imgui.slider_float("GAIL / Task Reward Ratio", app_state.reward_ratio, 0, 1)
 
         imgui.separator()
 
@@ -214,47 +218,59 @@ def setup_and_run_gui(pl: ImguiPlotter, app_state: AppState):
             learn_clicked = True
             test_clicked = True
 
-        # Rollout process: collect data for PPO and GAIL training
         if rollout_clicked:
-            app_state.ppo.env.venv.venv.trajectory = []
+            # Perform a reset based on curriculum
+            app_state.train_vecenv.reset()
+
+            old_radius = 0.01
+            new_radius = 0.01 + app_state.curriculum_stage * 0.02
+            radius_scale = new_radius / old_radius
+            q = app_state.train_vecenv.state.pipeline_state.q
+            qd = app_state.train_vecenv.state.pipeline_state.qd
+            q = q.at[..., 2:].set(q[..., 2:] * radius_scale)
+
+            new_first_pipeline_state = app_state.train_vecenv.env_container.jit_env_pipeline_init(q, qd)
+            new_first_obs = app_state.train_vecenv.env_container.jit_env_get_obs(new_first_pipeline_state)
+
+            app_state.train_vecenv.state = app_state.train_vecenv.state.replace(pipeline_state=new_first_pipeline_state, obs=new_first_obs)
+            app_state.train_vecenv.trajectory = [app_state.train_vecenv.state.pipeline_state.x]
+            app_state.train_vecenv.state.info["first_pipeline_state"] = new_first_pipeline_state
+            app_state.train_vecenv.state.info["first_obs"] = new_first_obs
+            app_state.ppo._last_obs = np.array(new_first_obs)
+
+            app_state.train_vecenv.trajectory = []
             app_state.ppo.collect_rollouts(
-                app_state.ppo.env,
+                app_state.train_vecenv,
                 app_state.ppo_callback,
                 app_state.ppo.rollout_buffer,
                 n_rollout_steps=app_state.rollout_length,
             )
-            app_state.trajectory_x = tree_stack(app_state.ppo.env.venv.venv.trajectory, 1)
+            app_state.train_trajectory_x = tree_stack(app_state.train_vecenv.trajectory, 1)
 
-            # Combine GAIL's discriminator reward with the task's reward
-            orig_reward = np.concatenate([app_state.ppo.ep_info_buffer], 0)
-            disc_reward = app_state.ppo.rollout_buffer.rewards
-            rewards = (1 - app_state.reward_ratio) * orig_reward + app_state.reward_ratio * disc_reward
-            app_state.ppo.rollout_buffer.rewards = rewards
-            app_state.ppo.rollout_buffer.compute_returns_and_advantage(app_state.ppo.values, app_state.ppo.dones)
-
-        # Learn process: trigger PPO and GAIL training
         if learn_clicked:
             app_state.ppo.train()
 
-            # GAIL discriminator training
-            gen_trajs, ep_lens = app_state.gail.venv_buffering.pop_trajectories()
-            app_state.gail._check_fixed_horizon(ep_lens)
-            gen_samples = rollout.flatten_trajectories_with_rew(gen_trajs)
-            app_state.gail._gen_replay_buffer.store(gen_samples)
-
-            # Train the discriminator multiple times per iteration
-            for _ in range(10):
-                app_state.gail.train_disc()
-
-        # Test process: evaluate the trained policy on the evaluation environment
         if test_clicked:
-            app_state.eval_obs = app_state.eval_vecenv.reset()
+            app_state.eval_vecenv.reset()
+            old_radius = 0.01
+            new_radius = 0.01 + app_state.curriculum_stage * 0.02
+            radius_scale = new_radius / old_radius
+            q = app_state.eval_vecenv.state.pipeline_state.q
+            qd = app_state.eval_vecenv.state.pipeline_state.qd
+            q = q.at[..., 2:].set(q[..., 2:] * radius_scale)
+            new_first_pipeline_state = app_state.eval_vecenv.env_container.jit_env_pipeline_init(q, qd)
+            new_first_obs = app_state.eval_vecenv.env_container.jit_env_get_obs(new_first_pipeline_state)
+            app_state.eval_obs = new_first_obs
+            app_state.eval_vecenv.state = app_state.eval_vecenv.state.replace(pipeline_state=new_first_pipeline_state, obs=new_first_obs)
+            app_state.eval_vecenv.trajectory = [app_state.eval_vecenv.state.pipeline_state.x]
+
             rewards = []
             for _ in range(app_state.rollout_length):
                 action = app_state.ppo.policy.predict(app_state.eval_obs, deterministic=app_state.deterministic)[0]
                 app_state.eval_obs, reward, done, _ = app_state.eval_vecenv.step(action)
                 rewards.append(reward)
             app_state.eval_rewards = np.stack(rewards, -1)
+            app_state.eval_trajectory_x = tree_stack(app_state.eval_vecenv.trajectory, 1)
 
         # Slider to adjust the number of iterations for training
         changed, app_state.n_iters = imgui.slider_int("# Iterations", app_state.n_iters, 1, 100)
@@ -275,60 +291,44 @@ def setup_and_run_gui(pl: ImguiPlotter, app_state: AppState):
         imgui.same_line()
         imgui.progress_bar(app_state.iter_i / app_state.n_iters, imgui.ImVec2(0, 0), f"{app_state.iter_i}/{app_state.n_iters}")
 
+        imgui.separator()
+
         # Checkbox to control visibility of the trails in the visualization
-        changed, app_state.show_trails = imgui.checkbox("Show Trails", app_state.show_trails)
+        st_checked, app_state.show_trails = imgui.checkbox("Show Trails", app_state.show_trails)
 
         # Radio buttons for selecting how to color the trails
         imgui.text("Trail Color Code")
-        cc_radio_clicked1 = imgui.radio_button("Body", app_state.color_code == 0)
-        if cc_radio_clicked1:
-            app_state.color_code = 0
+        cc_radio_clicked0, app_state.color_code = imgui.radio_button("Body", app_state.color_code, 0)
         imgui.same_line()
-        cc_radio_clicked2 = imgui.radio_button("Step Reward", app_state.color_code == 1)
-        if cc_radio_clicked2:
-            app_state.color_code = 1
+        cc_radio_clicked1, app_state.color_code = imgui.radio_button("Step Reward", app_state.color_code, 1)
         imgui.same_line()
-        cc_radio_clicked3 = imgui.radio_button("Cumulative Reward", app_state.color_code == 2)
-        if cc_radio_clicked3:
-            app_state.color_code = 2
+        cc_radio_clicked2, app_state.color_code = imgui.radio_button("Cumulative Reward", app_state.color_code, 2)
         imgui.same_line()
-        cc_radio_clicked4 = imgui.radio_button("Estimated Value", app_state.color_code == 3)
-        if cc_radio_clicked4:
-            app_state.color_code = 3
+        cc_radio_clicked3, app_state.color_code = imgui.radio_button("Estimated Value", app_state.color_code, 3)
         imgui.same_line()
-        cc_radio_clicked5 = imgui.radio_button("Advantage", app_state.color_code == 4)
-        if cc_radio_clicked5:
-            app_state.color_code = 4
-
-        cc_radio_clicked = np.any([cc_radio_clicked1, cc_radio_clicked2, cc_radio_clicked3, cc_radio_clicked4, cc_radio_clicked5])
+        cc_radio_clicked4, app_state.color_code = imgui.radio_button("Advantage", app_state.color_code, 4)
+        cc_radio_clicked = np.any([cc_radio_clicked0, cc_radio_clicked1, cc_radio_clicked2, cc_radio_clicked3, cc_radio_clicked4])
 
         imgui.separator()
+
+        imgui.text("Trail Source")
+        ts_radio_clicked1, app_state.trail_source = imgui.radio_button("Train", app_state.trail_source, 0)
+        imgui.same_line()
+        ts_radio_clicked2, app_state.trail_source = imgui.radio_button("Eval", app_state.trail_source, 1)
+        ts_radio_clicked = ts_radio_clicked1 or ts_radio_clicked2
 
         imgui.text("Trajectory Browser")
-        changed, app_state.traj_idx = imgui.slider_int("Trajectory Index", app_state.traj_idx, 0, app_state.train_vecenv.num_envs)
-        changed, app_state.traj_frame = imgui.slider_int("Frame", app_state.traj_frame, 0, app_state.rollout_length - 1)
+        traj_idx_ceiling = app_state.train_vecenv.num_envs - 1 if app_state.trail_source == 0 else app_state.eval_vecenv.num_envs - 1
+        traj_idx_changed, app_state.traj_idx = imgui.slider_int("Trajectory Index", app_state.traj_idx, 0, traj_idx_ceiling)
+        changed, app_state.traj_frame = imgui.slider_int("Frame", app_state.traj_frame, 0, app_state.rollout_length)
 
         imgui.separator()
 
-        imgui.text("Dataset Browser")
-        changed, app_state.show_ghost = imgui.checkbox("Show Ghost", app_state.show_ghost)
-        changed, app_state.dataset_frame = imgui.slider_int("Dataset Frame", app_state.dataset_frame, 0, app_state.dataset["infos/qpos"].shape[0])
-        changed, app_state.data_playing = imgui.checkbox("Play", app_state.data_playing)
-
-        imgui.separator()
-
-        imgui.text("Behaviour Cloning Control")
-        changed, app_state.bc_n_epochs = imgui.slider_int("# Epochs", app_state.bc_n_epochs, 1, 10)
-        bc_clicked = imgui.button("Behaviour Clone")
-        if bc_clicked:
-            app_state.bc.train(n_epochs=app_state.bc_n_epochs)
+        imgui.text("Curriculum Control")
+        imgui.checkbox("Show Curriculum Guide", True)
+        changed, app_state.curriculum_stage = imgui.slider_int("Stage", app_state.curriculum_stage, 0, 10)
 
         imgui.end()
-
-        if app_state.data_playing:
-            app_state.dataset_frame += 1
-            if app_state.dataset_frame >= app_state.dataset["infos/qpos"].shape[0]:
-                app_state.dataset_frame = 0
 
         rb_size = app_state.ppo.rollout_buffer.size()
         eval_state = app_state.eval_vecenv.state
@@ -336,75 +336,84 @@ def setup_and_run_gui(pl: ImguiPlotter, app_state: AppState):
             action = app_state.ppo.policy.predict(app_state.eval_obs, deterministic=app_state.deterministic)[0]
             app_state.eval_obs, reward, done, _ = app_state.eval_vecenv.step(action)
 
-        else:
-            # Trails
-            if app_state.show_trails and rb_size > 0:
-                if rollout_clicked:
-                    pos = np.array(app_state.trajectory_x.pos[app_state.traj_idx, :, 0])
-                    quat = np.array(app_state.trajectory_x.rot[app_state.traj_idx, :, 0])
-                    quat[..., [0, 1, 2, 3]] = quat[..., [1, 2, 3, 0]]
-                    app_state.trail_meshes[0, 0].points = pos
-                    app_state.trail_meshes[0, 0].lines = pv.MultipleLines(points=pos).lines
+        # Trails
+        for i in range(1):
+            if app_state.show_trails:
+                offset = np.array([[0.11, 0, 0]])
+                if rollout_clicked or test_clicked or traj_idx_changed or ts_radio_clicked or st_checked:
+                    if app_state.trail_source == 0 and app_state.train_trajectory_x is not None:
+                        pos = np.array(app_state.train_trajectory_x.pos[app_state.traj_idx, :, -2])
+                        quat = np.array(app_state.train_trajectory_x.rot[app_state.traj_idx, :, -2])
+                        pos = Rotation.from_quat(quat, scalar_first=True).apply(offset) + pos
+                        app_state.trail_meshes[i, 0].points = pos
+                        app_state.trail_meshes[i, 0].lines = pv.MultipleLines(points=pos).lines
+                        app_state.trail_actors[i, 0].SetVisibility(True)
 
-                app_state.trail_actors[0, 0].SetVisibility(True)
+                    elif app_state.trail_source == 1 and app_state.eval_trajectory_x is not None:
+                        pos = np.array(app_state.eval_trajectory_x.pos[app_state.traj_idx, :, -2])
+                        quat = np.array(app_state.eval_trajectory_x.rot[app_state.traj_idx, :, -2])
+                        pos = Rotation.from_quat(quat, scalar_first=True).apply(offset) + pos
+                        app_state.trail_meshes[i, 0].points = pos
+                        app_state.trail_meshes[i, 0].lines = pv.MultipleLines(points=pos).lines
+                        app_state.trail_actors[i, 0].SetVisibility(True)
+                    else:
+                        app_state.trail_actors[i, 0].SetVisibility(False)
             else:
-                app_state.trail_actors[0, 0].SetVisibility(False)
+                app_state.trail_actors[i, 0].SetVisibility(False)
 
         # Animating
         for i in range(len(app_state.scene_actors)):
-            if app_state.play_mode or app_state.trajectory_x is None:
+            if app_state.play_mode or (app_state.train_trajectory_x is None and app_state.eval_trajectory_x is None):
                 pos = np.array(eval_state.pipeline_state.x.pos[0, i])
                 quat = np.array(eval_state.pipeline_state.x.rot[0, i])
-                quat[..., [0, 1, 2, 3]] = quat[..., [1, 2, 3, 0]]
 
                 m = np.eye(4)
                 m[:3, 3] = pos
-                m[:3, :3] = Rotation.from_quat(quat).as_matrix()
+                m[:3, :3] = Rotation.from_quat(quat, scalar_first=True).as_matrix()
                 app_state.scene_actors[i].user_matrix = m
             else:
-                pos = np.array(app_state.trajectory_x.pos[app_state.traj_idx, app_state.traj_frame, i])
-                quat = np.array(app_state.trajectory_x.rot[app_state.traj_idx, app_state.traj_frame, i])
-                quat[..., [0, 1, 2, 3]] = quat[..., [1, 2, 3, 0]]
+                if app_state.trail_source == 0 and app_state.train_trajectory_x is not None:
+                    pos = np.array(app_state.train_trajectory_x.pos[app_state.traj_idx, app_state.traj_frame, i])
+                    quat = np.array(app_state.train_trajectory_x.rot[app_state.traj_idx, app_state.traj_frame, i])
 
-                m = np.eye(4)
-                m[:3, 3] = pos
-                m[:3, :3] = Rotation.from_quat(quat).as_matrix()
-                app_state.scene_actors[i].user_matrix = m
+                    m = np.eye(4)
+                    m[:3, 3] = pos
+                    m[:3, :3] = Rotation.from_quat(quat, scalar_first=True).as_matrix()
+                    app_state.scene_actors[i].user_matrix = m
 
-        if app_state.show_ghost:
-            qpos = jp.array(app_state.dataset["infos/qpos"][app_state.dataset_frame])
-            qvel = jp.array(app_state.dataset["infos/qvel"][app_state.dataset_frame])
-            data = mjx.make_data(app_state.eval_vecenv.env_container.env.sys)
-            data = data.replace(qpos=qpos, qvel=qvel)
-            data = jax.jit(mjx.forward)(app_state.eval_vecenv.env_container.env.sys, data)
-            poses = np.array(data.xpos[1:])
-            quats = np.array(data.xquat[1:])
-            for i in range(len(app_state.ghost_actors)):
-                pos = poses[i]
-                quat = quats[i]
-                quat[..., [0, 1, 2, 3]] = quat[..., [1, 2, 3, 0]]
+                elif app_state.trail_source == 1 and app_state.eval_trajectory_x is not None:
+                    pos = np.array(app_state.eval_trajectory_x.pos[app_state.traj_idx, app_state.traj_frame, i])
+                    quat = np.array(app_state.eval_trajectory_x.rot[app_state.traj_idx, app_state.traj_frame, i])
 
-                m = np.eye(4)
-                m[:3, 3] = pos
-                m[:3, :3] = Rotation.from_quat(quat).as_matrix()
-                app_state.ghost_actors[i].user_matrix = m
-                app_state.ghost_actors[i].SetVisibility(True)
-        else:
-            for i in range(len(app_state.ghost_actors)):
-                app_state.ghost_actors[i].SetVisibility(False)
+                    m = np.eye(4)
+                    m[:3, 3] = pos
+                    m[:3, :3] = Rotation.from_quat(quat, scalar_first=True).as_matrix()
+                    app_state.scene_actors[i].user_matrix = m
 
         # Coloring
-        if app_state.show_trails and (app_state.iterating or cc_radio_clicked or rollout_clicked):
-            colors = np.array([[0.5, 0.5, 0.5]]).repeat(app_state.trail_meshes[0, 0].n_points, 0)
-            if app_state.color_code == 1:
-                colors = matplotlib.colormaps["viridis"](app_state.ppo.rollout_buffer.rewards[..., app_state.traj_idx])[..., :3]
-            elif app_state.color_code == 2:
-                colors = matplotlib.colormaps["viridis"](app_state.ppo.rollout_buffer.returns.reshape(app_state.rollout_length, -1)[..., app_state.traj_idx])[..., :3]
-            elif app_state.color_code == 3:
-                colors = matplotlib.colormaps["viridis"](app_state.ppo.rollout_buffer.values.reshape(app_state.rollout_length, -1)[..., app_state.traj_idx])[..., :3]
-            elif app_state.color_code == 4:
-                colors = matplotlib.colormaps["viridis"](app_state.ppo.rollout_buffer.advantages.reshape(app_state.rollout_length, -1)[..., app_state.traj_idx])[..., :3]
-            app_state.trail_meshes[0, 0].point_data["color"] = colors
+        for i in range(1):
+            if app_state.show_trails and (app_state.iterating or cc_radio_clicked or rollout_clicked or test_clicked or traj_idx_changed or ts_radio_clicked):
+                color = [1.0, 1.0, 1.0]
+                colors = np.array([color]).repeat(app_state.trail_meshes[i, 0].n_points, 0)
+                if app_state.color_code == 1:
+                    colors = matplotlib.colormaps["viridis"](app_state.ppo.rollout_buffer.rewards[..., app_state.traj_idx])[..., :3]
+                elif app_state.color_code == 2:
+                    colors = matplotlib.colormaps["viridis"](app_state.ppo.rollout_buffer.returns.reshape(app_state.rollout_length, -1)[..., app_state.traj_idx])[..., :3]
+                elif app_state.color_code == 3:
+                    colors = matplotlib.colormaps["viridis"](app_state.ppo.rollout_buffer.values.reshape(app_state.rollout_length, -1)[..., app_state.traj_idx])[..., :3]
+                elif app_state.color_code == 4:
+                    colors = matplotlib.colormaps["viridis"](app_state.ppo.rollout_buffer.advantages.reshape(app_state.rollout_length, -1)[..., app_state.traj_idx])[..., :3]
+                app_state.trail_meshes[i, 0].point_data["color"] = colors
+
+        # Curriculum Guide
+        for i in range(1):
+            if app_state.show_guides:
+                radius = 0.01 + app_state.curriculum_stage * 0.02
+                app_state.guide_actors[i, 0].SetVisibility(True)
+                reference_cylinder_points = pv.Cylinder(radius=1, direction=(0.0, 0.0, 0.1), height=0.01).points
+                app_state.guide_meshes[i, 0].points[..., :2] = reference_cylinder_points[..., :2] * radius
+            else:
+                app_state.guide_actors[i, 0].SetVisibility(False)
 
         app_state.first_time = False
 
@@ -414,12 +423,13 @@ def setup_and_run_gui(pl: ImguiPlotter, app_state: AppState):
 
 
 def main(args):
-    env_name = "halfcheetah"
-    mjcf_path = "brax/envs/assets/half_cheetah.xml"
+    env_name = "reacher"
+    mjcf_path = "brax/envs/assets/reacher.xml"
 
     backend = "mjx"
     batch_size = 1024
     episode_length = 256
+
     train_env_container = EnvContainer(env_name, backend, batch_size, True, episode_length)
     eval_env_container = EnvContainer(env_name, backend, 16, False, episode_length)
     train_vecenv = MyVecEnv(train_env_container, seed=0)
@@ -440,71 +450,30 @@ def main(args):
             stats_window_size=episode_length,
         )
 
-    dataset = torch.load("data/dataset.pth")
-    transitions = Transitions(
-        obs=dataset["observations"][:-1],
-        acts=dataset["actions"][:-1],
-        infos=dataset["infos/qpos"][:-1],
-        next_obs=dataset["observations"][1:],
-        dones=dataset["terminals"][:-1] | dataset["timeouts"][:-1],
-    )
-
-    bc = BC(
-        policy=ppo.policy,
-        observation_space=train_vecenv.observation_space,
-        action_space=train_vecenv.action_space,
-        demonstrations=transitions,
-        rng=np.random.default_rng(0),
-        batch_size=16384,
-        optimizer_kwargs={"lr": 3e-4},
-    )
-    reward_net = BasicRewardNet(
-        observation_space=train_vecenv.observation_space,
-        action_space=train_vecenv.action_space,
-        normalize_input_layer=RunningNorm,
-        use_state=True,
-        use_action=False,
-        use_next_state=True,
-        use_done=False,
-    )
-    gail = GAIL(
-        demonstrations=transitions,
-        reward_net=reward_net,
-        venv=train_vecenv,
-        gen_algo=ppo,
-        demo_batch_size=16384,
-    )
-
     pl = ImguiPlotter()
-    plane_height = 0.0
-    if env_name == "inverted_pendulum":
-        plane_height = -0.5
-    plane = pv.Plane(center=(0, 0, plane_height), direction=(0, 0, 1), i_size=100, j_size=10)
+    plane = pv.Plane(center=(0, 0, 0), direction=(0, 0, 1), i_size=1, j_size=1)
 
     pl.add_mesh(plane, show_edges=True)
     pl.add_axes()
-    pl.camera.position = (0, -10, 0.1)
+    pl.camera.position = (0, 0, 1.0)
     pl.camera.focus = (0, 0, 0)
-    pl.camera.up = (0, 0, 1)
+    pl.camera.up = (1, 0, 0)
     # pl.enable_shadows()
     visual = XMLVisualDataContainer(mjcf_path)
     n = len(visual.meshes)
-    visuals = []
-    for i in range(2):
-        meshes = np.empty((n,), dtype=object)
-        actors = np.empty((n,), dtype=object)
-        for j, mesh in enumerate(visual.meshes):
-            mesh = mesh.copy()  # clone so we don't mutate the original
-            if i == 1:
-                color = [1.0, 0.0, 0.0]
-            else:
-                color = [1.0, 1.0, 1.0]
-            mesh.cell_data["color"] = np.array([color]).repeat(mesh.n_cells, 0)
-            actor = pl.add_mesh(mesh, scalars="color", rgb=True, show_scalar_bar=False)
-            meshes[j] = mesh
-            actors[j] = actor
-        visuals.append(VisualArray(meshes, actors))
-    scene_visuals, ghost_visuals = visuals
+    meshes = np.empty((n,), dtype=object)
+    actors = np.empty((n,), dtype=object)
+    for j, mesh in enumerate(visual.meshes):
+        mesh = mesh.copy()  # clone so we don't mutate the original
+        if j == len(visual.meshes) - 1:  # target in reacher
+            color = [1.0, 0.0, 0.0]
+        else:
+            color = [1.0, 1.0, 1.0]
+        mesh.cell_data["color"] = np.array([color]).repeat(mesh.n_cells, 0)
+        actor = pl.add_mesh(mesh, scalars="color", rgb=True, show_scalar_bar=False)
+        meshes[j] = mesh
+        actors[j] = actor
+    scene_visuals = VisualArray(meshes, actors)
 
     trail_meshes = np.empty((1, 1), dtype=object)
     trail_actors = np.empty((1, 1), dtype=object)
@@ -515,11 +484,20 @@ def main(args):
     trail_meshes[0, 0] = trail_mesh
     trail_actors[0, 0] = trail_actor
     trail_actor.SetVisibility(False)
-
     trail_visuals = VisualArray(trail_meshes, trail_actors)
 
+    guide_meshes = np.empty((1, 1), dtype=object)
+    guide_actors = np.empty((1, 1), dtype=object)
+    color = [0.0, 1.0, 0.0]
+    guide_mesh = pv.Cylinder(radius=1, direction=(0.0, 0.0, 0.1), height=0.01)
+    guide_mesh.cell_data["color"] = np.array([color]).repeat(guide_mesh.n_cells, 0)
+    guide_actor = pl.add_mesh(guide_mesh, scalars="color", rgb=True, show_scalar_bar=False, opacity=0.5)
+    guide_meshes[0, 0] = guide_mesh
+    guide_actors[0, 0] = guide_actor
+    guide_visuals = VisualArray(guide_meshes, guide_actors)
+
     # Run the GUI
-    app_state = AppState(scene_visuals, ghost_visuals, trail_visuals, train_vecenv, eval_vecenv, ppo, dataset, bc, gail)
+    app_state = AppState(scene_visuals, trail_visuals, guide_visuals, train_vecenv, eval_vecenv, ppo)
     setup_and_run_gui(pl, app_state)
 
 

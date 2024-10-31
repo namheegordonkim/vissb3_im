@@ -49,8 +49,8 @@ def rotate_np(vec: np.ndarray, quat: np.ndarray):
 
 
 def _transform_do(parent_pos: np.ndarray, parent_quat: np.ndarray, pos: np.ndarray, quat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    pos = parent_pos + math.rotate_np(pos, parent_quat)
-    rot = math.quat_mul_np(parent_quat, quat)
+    pos = parent_pos + rotate_np(pos, parent_quat)
+    rot = quat_mul_np(parent_quat, quat)
     return pos, rot
 
 

@@ -31,10 +31,7 @@ class MyVecEnv(VecEnv):
         self.trajectory = []
 
     def reset(self) -> VecEnvObs:
-        # np.random.seed(0)
         state = self.env_container.jit_env_reset(self.jax_rng)
-        self.jax_rng, _ = jax.random.split(self.jax_rng)
-        # state, _, _, _ = self.state_populator.populate_states()
         self.state = state
         self.trajectory = [state.pipeline_state.x]
         return np.array(state.obs)

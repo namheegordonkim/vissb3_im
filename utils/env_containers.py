@@ -38,4 +38,6 @@ class EnvContainer:
         )
         self.jit_env_reset = jax.jit(self.env.reset)
         self.jit_env_step = jax.jit(self.env.step)
+        self.jit_env_pipeline_init = jax.vmap(jax.jit(self.env.pipeline_init))
+        self.jit_env_get_obs = jax.vmap(jax.jit(self.env._get_obs))
         self.env_state = self.jit_env_reset(jax.random.PRNGKey(0))
