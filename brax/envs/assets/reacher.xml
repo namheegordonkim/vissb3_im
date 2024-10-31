@@ -35,7 +35,7 @@
         <joint axis="0 0 1" limited="true" name="joint1" pos="0 0 0" range="-3.0 3.0" type="hinge"/>
         <geom fromto="0 0 0 0.1 0 0" name="link1" size=".01" type="capsule"/>
         <body name="fingertip" pos="0.11 0 0">
-          <geom contype="0" name="fingertip" pos="0 0 0" size=".01" type="sphere"/>
+          <geom contype="0" name="fingertip" pos="0 0 0" size=".01 .01 .01" type="box"/>
         </body>
       </body>
     </body>

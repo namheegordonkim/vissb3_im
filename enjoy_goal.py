@@ -9,8 +9,6 @@ from utils.ppo import MyPPO
 from utils.tree_utils import tree_stack
 from utils.vecenv import MyVecEnv
 from viz.visual_data import XMLVisualDataContainer
-import jax
-import jax.numpy as jp
 import matplotlib
 import numpy as np
 import os
@@ -76,17 +74,20 @@ class AppState:
 
         # Initialize GUI state parameters
         self.color_code = 0  # Color coding for different visual elements.
+        self.curriculum_stage = 1
         self.data_playing = False
         self.dataset_frame = 0
         self.deterministic = False
         self.eval_obs = None
         self.eval_rewards = np.zeros((1, 1), dtype=float)
+        self.eval_trajectory_x = None
         self.first_time = True
         self.iter_i = 0
         self.iterating = False
         self.n_epochs = 1
-        self.n_iters = 10
+        self.n_iters = 20
         self.play_mode = False
+        self.policy_log_std = -1 * np.ones(2)
         self.pose_idx = 0
         self.reward_ratio = 0  # Ratio of GAIL reward to task reward.
         self.rollout_length = self.ppo.n_steps  # Number of steps in each rollout.
@@ -94,17 +95,12 @@ class AppState:
         self.show_ghost = True
         self.show_guides = True
         self.show_trails = True
+        self.trail_source = 0
+        self.train_trajectory_x = None
+        self.train_trajectory_x = None
         self.traj_frame = 0
         self.traj_idx = 0
         self.trajectory_t = 0
-        self.train_trajectory_x = None
-        self.train_trajectory_x = None
-        self.eval_trajectory_x = None
-        self.trail_source = 0
-        self.curriculum_stage = 10
-
-        self.old_q = self.train_vecenv.state.info["first_pipeline_state"].q
-        self.old_qd = self.train_vecenv.state.info["first_pipeline_state"].qd
 
 
 def setup_and_run_gui(pl: ImguiPlotter, app_state: AppState):
@@ -133,6 +129,12 @@ def setup_and_run_gui(pl: ImguiPlotter, app_state: AppState):
         setting parameters for BC (Behavior Cloning), GAIL, PPO, and more. It also manages visualization
         elements for displaying the environment and training states.
         """
+
+        # Refactored stuff to reuse over and over
+        center_offset = np.array([[(10 - app_state.curriculum_stage) * 0.02, 0, 0]])
+        old_radius = 0.01
+        new_radius = 0.01 + app_state.curriculum_stage * 0.02
+        radius_scale = new_radius / old_radius
 
         # Apply a dark theme to the GUI
         hello_imgui.apply_theme(hello_imgui.ImGuiTheme_.imgui_colors_dark)
@@ -174,12 +176,9 @@ def setup_and_run_gui(pl: ImguiPlotter, app_state: AppState):
         # If this is the first time loading or the reset button is clicked, reset evaluation environment
         if app_state.first_time or reset_clicked:
             app_state.eval_vecenv.reset()
-            old_radius = 0.01
-            new_radius = 0.01 + app_state.curriculum_stage * 0.02
-            radius_scale = new_radius / old_radius
             q = app_state.eval_vecenv.state.pipeline_state.q
             qd = app_state.eval_vecenv.state.pipeline_state.qd
-            q = q.at[..., 2:].set(q[..., 2:] * radius_scale)
+            q = q.at[..., 2:].set(q[..., 2:] * radius_scale + center_offset[..., :2])
             new_first_pipeline_state = app_state.eval_vecenv.env_container.jit_env_pipeline_init(q, qd)
             new_first_obs = app_state.eval_vecenv.env_container.jit_env_get_obs(new_first_pipeline_state)
             app_state.eval_obs = new_first_obs
@@ -221,13 +220,9 @@ def setup_and_run_gui(pl: ImguiPlotter, app_state: AppState):
         if rollout_clicked:
             # Perform a reset based on curriculum
             app_state.train_vecenv.reset()
-
-            old_radius = 0.01
-            new_radius = 0.01 + app_state.curriculum_stage * 0.02
-            radius_scale = new_radius / old_radius
             q = app_state.train_vecenv.state.pipeline_state.q
             qd = app_state.train_vecenv.state.pipeline_state.qd
-            q = q.at[..., 2:].set(q[..., 2:] * radius_scale)
+            q = q.at[..., 2:].set(q[..., 2:] * radius_scale + center_offset[..., :2])
 
             new_first_pipeline_state = app_state.train_vecenv.env_container.jit_env_pipeline_init(q, qd)
             new_first_obs = app_state.train_vecenv.env_container.jit_env_get_obs(new_first_pipeline_state)
@@ -238,7 +233,7 @@ def setup_and_run_gui(pl: ImguiPlotter, app_state: AppState):
             app_state.train_vecenv.state.info["first_obs"] = new_first_obs
             app_state.ppo._last_obs = np.array(new_first_obs)
 
-            app_state.train_vecenv.trajectory = []
+            app_state.ppo.policy.log_std.data[:] = torch.as_tensor(app_state.policy_log_std, dtype=torch.float)
             app_state.ppo.collect_rollouts(
                 app_state.train_vecenv,
                 app_state.ppo_callback,
@@ -249,15 +244,13 @@ def setup_and_run_gui(pl: ImguiPlotter, app_state: AppState):
 
         if learn_clicked:
             app_state.ppo.train()
+            app_state.policy_log_std = app_state.ppo.policy.log_std.data.detach().cpu().numpy()
 
         if test_clicked:
             app_state.eval_vecenv.reset()
-            old_radius = 0.01
-            new_radius = 0.01 + app_state.curriculum_stage * 0.02
-            radius_scale = new_radius / old_radius
             q = app_state.eval_vecenv.state.pipeline_state.q
             qd = app_state.eval_vecenv.state.pipeline_state.qd
-            q = q.at[..., 2:].set(q[..., 2:] * radius_scale)
+            q = q.at[..., 2:].set(q[..., 2:] * radius_scale + center_offset[..., :2])
             new_first_pipeline_state = app_state.eval_vecenv.env_container.jit_env_pipeline_init(q, qd)
             new_first_obs = app_state.eval_vecenv.env_container.jit_env_get_obs(new_first_pipeline_state)
             app_state.eval_obs = new_first_obs
@@ -266,7 +259,7 @@ def setup_and_run_gui(pl: ImguiPlotter, app_state: AppState):
 
             rewards = []
             for _ in range(app_state.rollout_length):
-                action = app_state.ppo.policy.predict(app_state.eval_obs, deterministic=app_state.deterministic)[0]
+                action = app_state.ppo.policy.predict(app_state.eval_obs, deterministic=True)[0]
                 app_state.eval_obs, reward, done, _ = app_state.eval_vecenv.step(action)
                 rewards.append(reward)
             app_state.eval_rewards = np.stack(rewards, -1)
@@ -327,6 +320,8 @@ def setup_and_run_gui(pl: ImguiPlotter, app_state: AppState):
         imgui.text("Curriculum Control")
         imgui.checkbox("Show Curriculum Guide", True)
         changed, app_state.curriculum_stage = imgui.slider_int("Stage", app_state.curriculum_stage, 0, 10)
+        for i in range(app_state.policy_log_std.shape[0]):
+            changed, app_state.policy_log_std[i] = imgui.slider_float(f"Policy Logstd {i}", app_state.policy_log_std[i].item(), -5, 0)
 
         imgui.end()
 
@@ -342,16 +337,16 @@ def setup_and_run_gui(pl: ImguiPlotter, app_state: AppState):
                 offset = np.array([[0.11, 0, 0]])
                 if rollout_clicked or test_clicked or traj_idx_changed or ts_radio_clicked or st_checked:
                     if app_state.trail_source == 0 and app_state.train_trajectory_x is not None:
-                        pos = np.array(app_state.train_trajectory_x.pos[app_state.traj_idx, :, -2])
-                        quat = np.array(app_state.train_trajectory_x.rot[app_state.traj_idx, :, -2])
+                        pos = np.array(app_state.train_trajectory_x.pos[app_state.traj_idx, 1:, -2])
+                        quat = np.array(app_state.train_trajectory_x.rot[app_state.traj_idx, 1:, -2])
                         pos = Rotation.from_quat(quat, scalar_first=True).apply(offset) + pos
                         app_state.trail_meshes[i, 0].points = pos
                         app_state.trail_meshes[i, 0].lines = pv.MultipleLines(points=pos).lines
                         app_state.trail_actors[i, 0].SetVisibility(True)
 
                     elif app_state.trail_source == 1 and app_state.eval_trajectory_x is not None:
-                        pos = np.array(app_state.eval_trajectory_x.pos[app_state.traj_idx, :, -2])
-                        quat = np.array(app_state.eval_trajectory_x.rot[app_state.traj_idx, :, -2])
+                        pos = np.array(app_state.eval_trajectory_x.pos[app_state.traj_idx, 1:, -2])
+                        quat = np.array(app_state.eval_trajectory_x.rot[app_state.traj_idx, 1:, -2])
                         pos = Rotation.from_quat(quat, scalar_first=True).apply(offset) + pos
                         app_state.trail_meshes[i, 0].points = pos
                         app_state.trail_meshes[i, 0].lines = pv.MultipleLines(points=pos).lines
@@ -395,23 +390,24 @@ def setup_and_run_gui(pl: ImguiPlotter, app_state: AppState):
             if app_state.show_trails and (app_state.iterating or cc_radio_clicked or rollout_clicked or test_clicked or traj_idx_changed or ts_radio_clicked):
                 color = [1.0, 1.0, 1.0]
                 colors = np.array([color]).repeat(app_state.trail_meshes[i, 0].n_points, 0)
-                if app_state.color_code == 1:
-                    colors = matplotlib.colormaps["viridis"](app_state.ppo.rollout_buffer.rewards[..., app_state.traj_idx])[..., :3]
-                elif app_state.color_code == 2:
-                    colors = matplotlib.colormaps["viridis"](app_state.ppo.rollout_buffer.returns.reshape(app_state.rollout_length, -1)[..., app_state.traj_idx])[..., :3]
-                elif app_state.color_code == 3:
-                    colors = matplotlib.colormaps["viridis"](app_state.ppo.rollout_buffer.values.reshape(app_state.rollout_length, -1)[..., app_state.traj_idx])[..., :3]
-                elif app_state.color_code == 4:
-                    colors = matplotlib.colormaps["viridis"](app_state.ppo.rollout_buffer.advantages.reshape(app_state.rollout_length, -1)[..., app_state.traj_idx])[..., :3]
+                if app_state.trail_source == 0:
+                    if app_state.color_code == 1:
+                        colors = matplotlib.colormaps["viridis"](app_state.ppo.rollout_buffer.rewards[..., app_state.traj_idx])[..., :3]
+                    elif app_state.color_code == 2:
+                        colors = matplotlib.colormaps["viridis"](app_state.ppo.rollout_buffer.returns.reshape(app_state.rollout_length, -1)[..., app_state.traj_idx])[..., :3]
+                    elif app_state.color_code == 3:
+                        colors = matplotlib.colormaps["viridis"](app_state.ppo.rollout_buffer.values.reshape(app_state.rollout_length, -1)[..., app_state.traj_idx])[..., :3]
+                    elif app_state.color_code == 4:
+                        colors = matplotlib.colormaps["viridis"](app_state.ppo.rollout_buffer.advantages.reshape(app_state.rollout_length, -1)[..., app_state.traj_idx])[..., :3]
                 app_state.trail_meshes[i, 0].point_data["color"] = colors
 
         # Curriculum Guide
         for i in range(1):
             if app_state.show_guides:
-                radius = 0.01 + app_state.curriculum_stage * 0.02
                 app_state.guide_actors[i, 0].SetVisibility(True)
-                reference_cylinder_points = pv.Cylinder(radius=1, direction=(0.0, 0.0, 0.1), height=0.01).points
-                app_state.guide_meshes[i, 0].points[..., :2] = reference_cylinder_points[..., :2] * radius
+                app_state.guide_meshes[i, 0].points = pv.Cylinder(radius=1, direction=(0.0, 0.0, 0.1), height=0.01).points
+                app_state.guide_meshes[i, 0].points[..., :2] *= new_radius
+                app_state.guide_meshes[i, 0].points += center_offset
             else:
                 app_state.guide_actors[i, 0].SetVisibility(False)
 
@@ -429,8 +425,10 @@ def main(args):
     backend = "mjx"
     batch_size = 1024
     episode_length = 256
+    train_reset_every = 256
 
-    train_env_container = EnvContainer(env_name, backend, batch_size, True, episode_length)
+    # train_env_container = EnvContainer(env_name, backend, batch_size, True, episode_length)
+    train_env_container = EnvContainer(env_name, backend, batch_size, True, train_reset_every)
     eval_env_container = EnvContainer(env_name, backend, 16, False, episode_length)
     train_vecenv = MyVecEnv(train_env_container, seed=0)
     eval_vecenv = MyVecEnv(eval_env_container, seed=0)
@@ -441,7 +439,7 @@ def main(args):
         ppo = MyPPO(
             "MlpPolicy",
             train_vecenv,
-            policy_kwargs={"log_std_init": -1, "net_arch": [64, 64]},
+            policy_kwargs={"log_std_init": -1, "net_arch": [256, 256], "activation_fn": torch.nn.ReLU},
             learning_rate=3e-4,
             max_grad_norm=0.1,
             batch_size=16384,
